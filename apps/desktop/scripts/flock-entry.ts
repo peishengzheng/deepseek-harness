@@ -5,6 +5,7 @@ import { once } from 'node:events'
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
+import { pnpmInvocation } from '../../../scripts/pnpm-invocation.ts'
 
 type FlockEntry = typeof import('@deepseek-ai/node-addon-system/flock')
 
@@ -77,7 +78,9 @@ async function buildNativeSystem(): Promise<void> {
     throw new Error(`desktop package: flock addon is not built; run ${BUILD_COMMAND_TEXT} or invoke this script through a pnpm package command`)
   }
   for (const args of BUILD_COMMANDS) {
-    const child = spawn(process.execPath, [pnpmEntry, ...args], { cwd: REPOSITORY_ROOT, stdio: 'inherit' })
+    // A native pnpm entrypoint cannot run through Node; pnpmInvocation picks the loader.
+    const invocation = pnpmInvocation(args, process.env)
+    const child = spawn(invocation.command, invocation.args, { cwd: REPOSITORY_ROOT, stdio: 'inherit' })
     const [code, signal] = await once(child, 'close') as [number | null, NodeJS.Signals | null]
     if (code !== 0) throw new Error(`desktop package: pnpm ${args.join(' ')} exited with ${String(code ?? signal)}`)
   }

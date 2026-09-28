@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { copyFile, mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { expect, it, vi } from 'vitest'
 import { createFlockEntryLoader } from '../scripts/flock-entry.ts'
@@ -93,14 +93,22 @@ it('propagates a build failure, does not import again, and retries on the next c
 })
 
 it('loads the proxy module where the addon package cannot be resolved', async () => {
-  // A directory outside every node_modules tree stands in for a checkout whose native/system is unbuilt.
+  // A tree outside every node_modules tree stands in for a checkout whose native/system is unbuilt;
+  // the repository-relative layout keeps the scripts' own source imports resolvable there.
   const root = await mkdtemp(join(tmpdir(), 'flock-entry-test-'))
   try {
-    for (const name of ['macos-notarization-proxy.ts', 'flock-entry.ts']) {
-      await copyFile(new URL(`../scripts/${name}`, import.meta.url), join(root, name))
+    const copies: ReadonlyArray<readonly [source: string, destination: string]> = [
+      ['../scripts/macos-notarization-proxy.ts', 'apps/desktop/scripts/macos-notarization-proxy.ts'],
+      ['../scripts/flock-entry.ts', 'apps/desktop/scripts/flock-entry.ts'],
+      ['../../../scripts/pnpm-invocation.ts', 'scripts/pnpm-invocation.ts'],
+    ]
+    for (const [source, destination] of copies) {
+      const target = join(root, destination)
+      await mkdir(dirname(target), { recursive: true })
+      await copyFile(new URL(source, import.meta.url), target)
     }
     const child = spawn(process.execPath, ['--input-type=module', '-e', `
-      const module = await import(${JSON.stringify(pathToFileURL(join(root, 'macos-notarization-proxy.ts')).href)});
+      const module = await import(${JSON.stringify(pathToFileURL(join(root, 'apps/desktop/scripts/macos-notarization-proxy.ts')).href)});
       process.stdout.write(Object.keys(module).sort().join(','));
     `], { stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH } })
     let stdout = ''

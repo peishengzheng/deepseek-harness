@@ -89,6 +89,26 @@ it.each(['preflight:windows-signing', 'run build:official', 'run sign:primary-ru
   expect(writeFileSync).not.toHaveBeenCalled()
 })
 
+it.each([
+  { entry: 'fixture-pnpm.cjs', throughNode: true },
+  { entry: String.raw`C:\tools\pnpm.exe`, throughNode: false },
+])('runs the pnpm entrypoint $entry through the loader its own format requires', async ({ entry, throughNode }) => {
+  const { run } = supervisor()
+  vi.stubEnv('npm_execpath', entry)
+  await packageTarget(parseDesktopPackageInvocation(['win-x64', '--unsigned'], 'win32', 'x64'), environment, run)
+  const build = run.run.mock.calls.find(([stage]) => stage === 'run build:official')
+  expect(build).toBeDefined()
+  const [, executable, args] = build!
+  if (throughNode) {
+    expect(executable).toBe(process.execPath)
+    expect(args[0]).toBe(entry)
+  } else {
+    expect(executable).toBe(entry)
+    expect(args[0]).not.toBe(entry)
+  }
+  expect(args.slice(-2)).toEqual(['run', 'build:official'])
+})
+
 it.each(['--unsigned', '--prepare-only'])('keeps %s hardware-free and creates no release record', async (mode) => {
   const { run, stages } = supervisor()
   await packageTarget(parseDesktopPackageInvocation(['win-x64', mode], 'win32', 'x64'), environment, run)
