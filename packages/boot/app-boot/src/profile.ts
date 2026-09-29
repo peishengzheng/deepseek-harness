@@ -31,6 +31,7 @@ import type { DshBundleManifest, DshPackageManifest } from '@deepseek-ai/dsh-pac
 import { evaluatePluginCompatibility, pluginCompatibilityWarning } from './plugin-compatibility.ts'
 import { readProfileVersionExemptions } from './profile-compatibility.ts'
 import { loadOverlayPatches } from './index.ts'
+import { parseManifestJson } from './manifest-json.ts'
 import { realModuleDirectory } from './profile-resolution/legacy-links.ts'
 
 /** Directory under the Harness home holding every profile. */
@@ -351,7 +352,7 @@ function pointsInto(link: string, root: string): boolean {
 
 /** Read one package manifest while traversing a dependency graph. */
 function readPackageManifest(anchor: string): ProfileManifest {
-  return JSON.parse(readFileSync(anchor, 'utf8')) as ProfileManifest
+  return parseManifestJson(readFileSync(anchor, 'utf8')) as ProfileManifest
 }
 
 /** Return dependency names that may be imported by a loader-visible plugin. */
@@ -537,7 +538,7 @@ function collectProfileScopePackages(
 }
 
 /**
- * Read a profile's manifest.
+ * Read a profile's manifest, accepting a leading UTF-8 BOM.
  * @param binName - the diagnostic prefix on the thrown error.
  * @param dir - the profile directory.
  * @returns the parsed manifest.
@@ -551,7 +552,7 @@ export function readProfileManifest(binName: string, dir: string): ProfileManife
     throw new Error(`${binName}: failed to read profile manifest ${path}: ${String(error)}`)
   }
   // The field checks below validate the file data before trusting the parse type.
-  const parsed = JSON.parse(raw) as ProfileManifest | null
+  const parsed = parseManifestJson(raw) as ProfileManifest | null
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${binName}: profile manifest ${path} must hold a JSON object`)
   }

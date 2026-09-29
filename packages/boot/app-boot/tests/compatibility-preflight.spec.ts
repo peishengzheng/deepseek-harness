@@ -31,13 +31,14 @@ function fixture() {
   })
   onTestFinished(() => { stderr.mockRestore() })
 
-  function plugin(name: string, options: { version?: string; peer?: string; alias?: string } = {}): void {
+  function plugin(name: string, options: { version?: string; peer?: string; alias?: string; bom?: boolean } = {}): void {
     const packageDir = join(dir, 'node_modules', options.alias ?? name)
     mkdirSync(packageDir, { recursive: true })
-    writeFileSync(join(packageDir, 'package.json'), JSON.stringify({
+    const manifest = JSON.stringify({
       name, version: options.version ?? '1.0.0', type: 'module', exports: './index.mjs',
       ...options.peer === undefined ? {} : { peerDependencies: { '@deepseek-ai/dsh-test': options.peer } },
-    }))
+    })
+    writeFileSync(join(packageDir, 'package.json'), options.bom === true ? `\uFEFF${manifest}` : manifest)
     writeFileSync(join(packageDir, 'index.mjs'), `import { appendFileSync } from 'node:fs'
 const record = (value) => appendFileSync(new URL('${pathToFileURL(effects).href}'), value + '\\n')
 record('import:${name}')
@@ -83,6 +84,13 @@ it('blocks an incompatible plugin before its module is imported while a compatib
   expect(effects).toEqual(['import:allowed-plugin', 'apply:allowed-plugin'])
   expect(f.warnings.join('\n')).toContain('denied-plugin@1.0.0')
   expect(f.warnings.join('\n')).toContain('data loss')
+})
+
+it('admits a compatible plugin whose manifest carries a UTF-8 BOM', async () => {
+  const f = fixture()
+  f.plugin('bom-plugin', { bom: true })
+  expect(await f.run(insert('bom-plugin'))).toEqual(['import:bom-plugin', 'apply:bom-plugin'])
+  expect(f.warnings.join('\n')).not.toContain('cannot be validated')
 })
 
 it('admits the same plugin only for its exact version and the running runtime', async () => {

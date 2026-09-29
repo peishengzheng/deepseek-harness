@@ -147,7 +147,7 @@ The startup error also retains inactive-entry metadata and raw startup warning/e
 
 ### Helper behavior
 
-The exports each own one stage of the boot: config resolution and snapshot replay, layered environment loading, fail-loud reporting, activation auditing, patch parsing, root-include mounting, config dump rendering, profile composition, and the harness-source section. Per-export contracts live in the code, not this README — see [`src/index.ts`](src/index.ts) and [`src/profile.ts`](src/profile.ts).
+The exports each own one stage of the boot: config resolution and snapshot replay, layered environment loading, fail-loud reporting, activation auditing, patch parsing, root-include mounting, config dump rendering, profile composition, and the harness-source section. Manifest JSON readers drop one leading UTF-8 BOM, which Windows editors and PowerShell 5.1 write into files that Node, npm, and pnpm still accept. Per-export contracts live in the code, not this README — see [`src/index.ts`](src/index.ts) and [`src/profile.ts`](src/profile.ts).
 
 ### Source map
 
@@ -157,6 +157,7 @@ The exports each own one stage of the boot: config resolution and snapshot repla
 | [`src/profile.ts`](src/profile.ts) | Profile discovery, initialization, bundle resolution, runtime resolution construction |
 | [`src/profile-plugins.ts`](src/profile-plugins.ts) | Installed dependencies, bundle activation policy, and manifest updates |
 | [`src/profile-sanitize.ts`](src/profile-sanitize.ts) | Profile patch backup and recovery bundle activation |
+| [`src/manifest-json.ts`](src/manifest-json.ts) | Shared manifest JSON parsing: one leading UTF-8 BOM is dropped |
 | [`src/config-schema/`](src/config-schema/) | Profile schema generation, discovery, native projection, and result types |
 | [`src/profile-resolution/`](src/profile-resolution/) | Runtime resolver, package-metadata service, and built Worker bootstrap |
 | — | No runtime invariant companion is published; one interception owns each runtime resolution. |

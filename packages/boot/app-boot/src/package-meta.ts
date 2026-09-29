@@ -5,6 +5,7 @@ import { dirname, extname, isAbsolute, relative, resolve, sep, win32 } from 'nod
 import { fileURLToPath } from 'node:url'
 import { ModuleLoader } from '@deepseek-ai/cordis-plugin-loader'
 import type { LocalizedText, PluginLocalizedMeta } from '@deepseek-ai/dsh-package-manifest'
+import { parseManifestJson } from './manifest-json.ts'
 import { barePackageName } from './profile-resolution/resolver.ts'
 
 const LANGUAGE_ID = /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u
@@ -87,7 +88,7 @@ function textOf(value: unknown, path: string): string | undefined {
 function readObject(file: string): Record<string, unknown> {
   let contents: unknown
   try {
-    contents = JSON.parse(readFileSync(file, 'utf8'))
+    contents = parseManifestJson(readFileSync(file, 'utf8'))
   } catch (error) {
     throw new Error(`${file}: ${String(error)}`)
   }

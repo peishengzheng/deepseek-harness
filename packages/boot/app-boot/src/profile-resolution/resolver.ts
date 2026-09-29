@@ -8,6 +8,7 @@ import { getEnvironmentData, setEnvironmentData } from 'node:worker_threads'
 import type { ModuleLoaderV1, ModuleLoaderV2, ResolveResult } from '@deepseek-ai/cordis-plugin-loader'
 import { imports as resolvePackageImports, type Package as ResolvePackageManifest } from 'resolve.exports'
 import type { RuntimeResolutionEntry, RuntimeResolution } from '../profile.ts'
+import { parseManifestJson } from '../manifest-json.ts'
 
 const WORKER_RESOLUTION_KEY = '@deepseek-ai/dsh-app-boot/profile-resolution'
 const EMPTY_ATTRIBUTES: ImportAttributes = Object.freeze({})
@@ -210,7 +211,7 @@ function findInterceptionLayer(path: string, resolution: CompiledResolution): In
 /** Package names a directory's current manifest lists as peers; an unreadable manifest lists none. */
 function readPeerNames(directory: string): ReadonlySet<string> {
   try {
-    const manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')) as {
+    const manifest = parseManifestJson(readFileSync(join(directory, 'package.json'), 'utf8')) as {
       peerDependencies?: unknown
     }
     const peers = manifest.peerDependencies
@@ -265,7 +266,7 @@ function selfReferenceName(parent: string): string | false | null {
     if (existsSync(manifestPath)) {
       let manifest: Record<string, unknown>
       try {
-        manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+        manifest = parseManifestJson(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
       } catch (_error) {
         // Only Node decides whether this request consumes an invalid package manifest.
         return null
@@ -291,7 +292,7 @@ function packageImportsTarget(
     if (existsSync(manifestPath)) {
       let manifest: ResolvePackageManifest
       try {
-        manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as ResolvePackageManifest
+        manifest = parseManifestJson(readFileSync(manifestPath, 'utf8')) as ResolvePackageManifest
       } catch (_error) {
         // The native resolver retains invalid package-target and manifest diagnostics.
         /* v8 ignore next -- native resolution cannot report MODULE_NOT_FOUND after an invalid scope manifest */
@@ -338,7 +339,7 @@ function localCandidateOwnsResolution(candidate: string, resolved: string, reque
   /* v8 ignore next -- a bounded native lookup can escape a candidate only through its root legacy main */
   if (request !== name) return false
   try {
-    const manifest = JSON.parse(readFileSync(join(candidate, 'package.json'), 'utf8')) as Record<string, unknown>
+    const manifest = parseManifestJson(readFileSync(join(candidate, 'package.json'), 'utf8')) as Record<string, unknown>
     /* v8 ignore next -- a bounded native lookup outside the package directory requires a legacy main */
     if (typeof manifest.main !== 'string') return false
     const main = createRequire(join(candidate, 'package.json')).resolve(resolve(candidate, manifest.main))

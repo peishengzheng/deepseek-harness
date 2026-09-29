@@ -13,6 +13,7 @@ import {
 } from './resolver.ts'
 import type { RuntimeResolution } from '../profile.ts'
 import { readPluginMeta } from '../package-meta.ts'
+import { parseManifestJson } from '../manifest-json.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -44,7 +45,7 @@ export interface PluginPackagesConfig {
 function readPackage(dir: string, fallbackName: string): PluginPackage | undefined {
   const manifestPath = join(dir, 'package.json')
   if (!existsSync(manifestPath)) return undefined
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+  const manifest = parseManifestJson(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
   const name = manifest.name
   const version = manifest.version
   return {

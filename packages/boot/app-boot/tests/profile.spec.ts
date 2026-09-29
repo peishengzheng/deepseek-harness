@@ -233,6 +233,16 @@ describe('manifest round-trip', () => {
     expect(() => readProfileManifest('t', dir)).toThrow('must hold a JSON object')
     expect(() => readProfileManifest('t', join(dir, 'nope'))).toThrow('failed to read profile manifest')
   })
+
+  it('reads a manifest saved with a UTF-8 BOM and rewrites it without one', () => {
+    const dir = tmp()
+    const manifest = { name: 'p', dsh: { profile: { bundles: ['a'] } } }
+    writeFileSync(join(dir, 'package.json'), `\uFEFF${JSON.stringify(manifest, undefined, 2)}\n`)
+    const read = readProfileManifest('t', dir)
+    expect(read.dsh?.profile?.bundles).toEqual(['a'])
+    writeProfileManifest(dir, read)
+    expect(readFileSync(join(dir, 'package.json'), 'utf8').startsWith('{')).toBe(true)
+  })
 })
 
 describe('resolveBundleDir', () => {
@@ -497,6 +507,15 @@ describe('createRuntimeResolution', () => {
     expect(resolution.entries.find(entry => entry.name === 'dep-of-a')?.packageDir).toBe(join(modules, 'dep-of-a'))
     expect(existsSync(join(home, 'profiles', 'node_modules'))).toBe(false)
     await expect(createRuntimeResolution({ installAnchor: anchor, home })).resolves.toEqual(resolution)
+  })
+
+  it('reads a dependency manifest saved with a UTF-8 BOM', async () => {
+    const anchor = stageInstallation({ 'bundle-a': { patch: '[]\n', deps: { 'dep-of-a': '0.0.0' } } })
+    const modules = join(anchor, '..', 'node_modules')
+    mkdirSync(join(modules, 'dep-of-a'), { recursive: true })
+    writeFileSync(join(modules, 'dep-of-a', 'package.json'), `\uFEFF${JSON.stringify({ name: 'dep-of-a', version: '0.0.0' })}`)
+    const resolution = await createRuntimeResolution({ installAnchor: anchor, home: tmp() })
+    expect(resolution.entries.find(entry => entry.name === 'dep-of-a')?.packageDir).toBe(join(modules, 'dep-of-a'))
   })
 
   it('keeps selected bundle closures profile-local without overriding installation packages', async () => {

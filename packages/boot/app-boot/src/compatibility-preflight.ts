@@ -7,6 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { load } from 'js-yaml'
+import { parseManifestJson } from './manifest-json.ts'
 import { resolvePluginResource } from './package-meta.ts'
 import { barePackageName } from './profile-resolution/resolver.ts'
 import type {} from './profile-resolution/service.ts'
@@ -15,7 +16,7 @@ import { evaluatePluginCompatibility, pluginCompatibilityWarning } from './plugi
 import { readProfileCompatibility } from './profile-compatibility.ts'
 
 function readManifest(filename: string): object {
-  return JSON.parse(readFileSync(filename, 'utf8')) as object
+  return parseManifestJson(readFileSync(filename, 'utf8')) as object
 }
 
 /** Render the patch wording an Include would report, through the profile's logger. */
