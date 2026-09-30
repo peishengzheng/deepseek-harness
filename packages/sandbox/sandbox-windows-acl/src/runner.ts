@@ -3,8 +3,14 @@
  * seam spawns in place of the caller's command. It creates the
  * WRITE_RESTRICTED token with the workspace write-SID allowlist, spawns the
  * wrapped argv under it with the CALLER'S stdio inherited (bytes flow
- * straight through), mirrors the child's exit code, and revokes its temp
- * grant on exit (workspace ACEs stay standing as the reuse cache).
+ * straight through), mirrors the child's exit code, and revokes the private
+ * temp grant it owns on exit from whichever in-process exit path arrives
+ * first — the child's exit, a runner-side throw, or a later unhandled
+ * failure. Workspace ACEs and their Low label stay standing: they are shared
+ * by every command in that workspace, and re-applying them per command would
+ * re-propagate the tree per command. The seam that owns the workspace grant
+ * revokes it at provider dispose, and reclaims what an unclean exit left
+ * behind at provider start.
  *
  * Stable argv contract (the seam builds it; a native-exe replacement would
  * keep the same contract):
@@ -142,6 +148,34 @@ async function main(): Promise<number> {
   let ownedTempDir: string | undefined
   let sandbox: AclSandbox | undefined
   let initialized = false
+  let disposed = false
+  /**
+   * Revoke the private temp grant this runner owns exactly once, from
+   * whichever exit path arrives first. A force-kill runs none of them; the
+   * temp directory and its record are reclaimed by the next provider start's
+   * sweep. Workspace grants are never revoked here — they stand for the
+   * workspace and belong to the seam's lifetime.
+   */
+  const disposeSandbox = (): void => {
+    if (disposed) return
+    disposed = true
+    try {
+      sandbox?.dispose()
+    } catch (error) {
+      process.stderr.write(`${RUNNER_SIGNATURE}: cleanup: ${error instanceof Error ? error.message : String(error)}\n`)
+    }
+  }
+  process.on('exit', disposeSandbox)
+  process.on('uncaughtException', (error) => {
+    process.stderr.write(`${RUNNER_SIGNATURE}: ${error.message}\n`)
+    disposeSandbox()
+    process.exit(RUNNER_FAILURE_EXIT)
+  })
+  process.on('unhandledRejection', (reason) => {
+    process.stderr.write(`${RUNNER_SIGNATURE}: ${reason instanceof Error ? reason.message : String(reason)}\n`)
+    disposeSandbox()
+    process.exit(RUNNER_FAILURE_EXIT)
+  })
   try {
     let privateTempDir: string | null = null
     let writeSid: string | undefined
@@ -190,13 +224,7 @@ async function main(): Promise<number> {
     return result.exitCode
   } finally {
     // Cleanup failures must not mask the child's exit code: report and keep going.
-    if (initialized) {
-      try {
-        sandbox?.dispose()
-      } catch (error) {
-        process.stderr.write(`${RUNNER_SIGNATURE}: cleanup: ${error instanceof Error ? error.message : String(error)}\n`)
-      }
-    }
+    if (initialized) disposeSandbox()
     if (ownedTempDir !== undefined) {
       try {
         rmSync(ownedTempDir, { recursive: true, force: true })

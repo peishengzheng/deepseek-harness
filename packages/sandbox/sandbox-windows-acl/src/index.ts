@@ -31,15 +31,18 @@
  *    STATUS_DLL_INIT_FAILED under the restriction);
  *  - the private temp directory and every writable directory must be owned by the
  *    caller (owner-implicit WRITE_DAC);
- *  - grants are standing ACE mutations on real directories. WORKSPACE grants
- *    are deliberately never revoked — the ACE is the cross-session reuse
- *    cache (revoking would force the next session to re-propagate the whole
- *    tree). TEMP grants are revocable: dispose() removes them so a standing
- *    inheritable ACE never outlives its session's temp directory. The
- *    ambient temp root is never granted implicitly. With `manageDacls: false`
- *    the CALLER owns the DACLs (the sandbox seam's grant reuse):
- *    init()/dispose() skip grant/revoke entirely and the caller must not
- *    revoke under live children.
+ *  - grants are security-descriptor mutations on real directories. A workspace
+ *    grant is standing: every command in that workspace shares it, and
+ *    re-applying it per command would re-propagate the whole tree per command
+ *    (one write on a directory with descendants walks them, whatever the
+ *    inheritance flags). The seam that owns the workspace grant revokes it at
+ *    provider dispose and reclaims an unclean exit's record at provider start
+ *    ({@link sweepStaleGrantLeases}); this instance's own revoke covers the
+ *    private temp grant. A path whose lease another LIVE process holds is
+ *    never revoked by this one (see the `grant-journal` module). The ambient
+ *    temp root is never granted implicitly. With `manageDacls: false` the
+ *    CALLER owns the DACLs (the sandbox seam's grant reuse): init()/dispose()
+ *    skip grant/revoke entirely and the caller must not revoke under live children.
  * @module @deepseek-ai/dsh-sandbox-windows-acl
  */
 
@@ -47,17 +50,54 @@ import { existsSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Win32Error } from '@deepseek-ai/dsh-win32-process'
 
-import { grantWrite, revokeWrite } from './acl.ts'
-import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, win32 } from './ffi.ts'
+import { fullTreeCleanup, grantWrite, revokeWrite } from './acl.ts'
+import type { TreeCleanupResult } from './acl.ts'
+import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, win32, win32Sync } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
+import { holdGrantLease } from './grant-journal.ts'
+import type { GrantLease } from './grant-journal.ts'
 import { assertPrivateTempDisjoint } from './path-boundary.ts'
 import { drainPipe, spawnSandboxed, spawnSandboxedInherited, waitForExit } from './spawn.ts'
 import { createRestrictedToken, findLogonSid, makeWellKnownSid, openCurrentProcessToken, restrictTokenIntegrity, setTokenDefaultDaclGrant } from './token.ts'
+import { workspaceWriteSid } from './workspace-sid.ts'
 import * as abi from './win32-abi.ts'
 
 export { AclWriteGrant } from './grant.ts'
+export { fullTreeCleanup } from './acl.ts'
+export type { TreeCleanupResult } from './acl.ts'
+export { grantJournalDirectory, grantJournalPath, grantLeasePath, sweepStaleGrantLeases } from './grant-journal.ts'
+export type { GrantLease, GrantSweepResult } from './grant-journal.ts'
 export { assertTempRootOutsideWorkspace } from './path-boundary.ts'
 export { tempWriteSid, workspaceWriteSid } from './workspace-sid.ts'
+
+/**
+ * Clear one granted tree on demand, resolving the binding table and the
+ * workspace's capability SID when the caller supplies neither. This is the
+ * manual entry point for a plugin or command (`sandbox:clean-sacl`): the exit
+ * path never calls it, and the grant's own disposal covers the trees a run
+ * actually granted.
+ * @param root - the granted workspace root to clean.
+ * @param writeSid - the capability SID string; defaults to the workspace's derived SID.
+ * @param api - the binding table; the cached one is resolved when omitted.
+ * @returns the visited count, the cleaned objects, and every per-object failure.
+ */
+export function cleanWorkspaceTree(
+  root: string,
+  writeSid: string = workspaceWriteSid(root),
+  api?: Win32Bindings,
+): TreeCleanupResult {
+  const bindings = api ?? win32Sync()
+  const slot = allocPtrSlot()
+  if (bindings.convertStringSidToSidW(writeSid, slot) === 0) throwLastError(bindings, 'ConvertStringSidToSidW', writeSid)
+  const sidPtr = decodePtr(slot)
+  if (sidPtr === null) throwLastError(bindings, 'ConvertStringSidToSidW', `null SID for ${writeSid}`)
+  try {
+    return fullTreeCleanup(bindings, root, sidPtr)
+  } finally {
+    const freed = bindings.localFree(sidPtr)
+    if (!isNullPtr(freed)) throwLastError(bindings, 'LocalFree', `cleanWorkspaceTree SID ${writeSid}`)
+  }
+}
 /** Construction options: the workspace/temp allowlists and their distinct SID identities. */
 export interface AclSandboxOptions {
   /** Directories the confined child may write into (must exist and be caller-owned). */
@@ -80,7 +120,7 @@ export interface AclSandboxOptions {
    * The private temp directory's write SID. Required whenever
    * workspace-write grants a temp directory, absent otherwise. It must be
    * distinct from {@link writeSid}, so sibling sessions sharing a workspace
-   * cannot use the standing workspace capability in one another's temp tree.
+   * cannot use the shared workspace capability in one another's temp tree.
    */
   tempWriteSid?: string
   /**
@@ -152,10 +192,10 @@ function freeSidBestEffort(
 
 /**
  * One write-restricted sandbox instance: token + write-SID grants + spawn.
- * `init()` is fail-closed — any Win32 failure revokes the revocable (temp)
- * grants and throws; `dispose()` revokes the temp grants, leaves the
- * standing workspace ACEs in place (the cross-instance reuse cache), frees
- * every allocation, and reports every cleanup failure. With
+ * `init()` is fail-closed — any Win32 failure revokes the grants it recorded
+ * and throws; `dispose()` revokes the private temp grant it owns (clearing the
+ * shared Low label there), frees every allocation, and reports every cleanup
+ * failure. Workspace grants stay standing in this flow. With
  * `manageDacls: false` the caller owns the grants (the sandbox seam's grant
  * reuse): init() applies none and dispose() revokes none.
  */
@@ -177,7 +217,7 @@ export class AclSandbox {
   private tempWriteSidPtr: NativePtr | undefined
   /** The well-known/logon SID allocations init() makes; freed by dispose() alongside the write SIDs. */
   private sidAllocations: NativePtr[] = []
-  private grantedPaths: Array<{ path: string; sidPtr: NativePtr }> = []
+  private grantedPaths: Array<{ path: string; sidPtr: NativePtr; lease: GrantLease }> = []
 
   constructor(options: AclSandboxOptions) {
     this.mode = options.mode
@@ -254,27 +294,27 @@ export class AclSandbox {
 
       // manageDacls: false — the caller (the sandbox seam's grant) already
       // materialized the ACEs; this instance must neither add nor remove any.
-      // When this instance owns the DACLs, writableDir ACEs are STANDING (the
-      // per-workspace reuse cache — dispose() never revokes them, or the next
-      // provision would re-propagate the whole tree) and the temp ACE is
-      // REVOCABLE (dispose() removes it before the private directory is
-      // deleted; the ambient temp root is never granted).
+      // When this instance owns the DACLs, the WORKSPACE grants are STANDING:
+      // one per workspace, shared by every command that workspace runs, and
+      // left in place because re-applying them per command would re-propagate
+      // the tree per command. Only the private temp grant carries a lease and
+      // is revoked at dispose — or reclaimed by the seam's next sweep after an
+      // unclean exit. The ambient temp root is never granted.
       // The Low label SID and the world SID the grants deny and label with.
       const lowLabelSid = makeWellKnownSid(api, abi.WinLowLabelSid)
       const worldSid = makeWellKnownSid(api, abi.WinWorldSid)
       this.sidAllocations.push(lowLabelSid, worldSid)
 
       if (this.manageDacls) {
-        if (this.writeSidPtr !== undefined) {
+        const writeSidPtr = this.writeSidPtr
+        if (writeSidPtr !== undefined) {
           for (const path of this.writableDirs) {
-            grantWrite(api, path, this.writeSidPtr, lowLabelSid, worldSid)
+            grantWrite(api, path, writeSidPtr, lowLabelSid, worldSid)
           }
-          if (tempDir !== null && this.tempWriteSidPtr !== undefined) {
-            // Record BEFORE granting: grantWrite can throw after a successful
-            // apply (a LocalFree failure), and the fail-closed catch must still
-            // revoke that path (revoking an ungranted path is a no-op merge).
-            this.grantedPaths.push({ path: tempDir, sidPtr: this.tempWriteSidPtr })
-            grantWrite(api, tempDir, this.tempWriteSidPtr, lowLabelSid, worldSid)
+          const tempWriteSidPtr = this.tempWriteSidPtr
+          if (tempDir !== null && tempWriteSidPtr !== undefined) {
+            // workspace-write with temp requires the temp write SID (constructor).
+            this.leaseAndGrant(api, tempDir, this.tempWriteSid as string, tempWriteSidPtr, lowLabelSid, worldSid)
           }
         }
       }
@@ -305,10 +345,11 @@ export class AclSandbox {
       currentTokenOpen = false
       this.api = api
     } catch (error) {
-      // Fail-closed cleanup: never leave a revocable (temp) grant or SID
-      // allocation behind a failed init. Standing workspace ACEs are NOT
-      // revoked — they are the intended end state (the reuse cache), not an
-      // error artifact.
+      // Fail-closed cleanup: never leave a grant this instance owns or SID
+      // allocation behind a failed init. Every recorded path carries the lease
+      // this instance took, so revoking it is exactly the ownership Dispose
+      // would exercise; a path owned by another live process was never
+      // recorded.
       const cleanupFailures: unknown[] = []
       if (currentTokenOpen && api.closeHandle(currentToken) === 0) {
         cleanupFailures.push(new Win32Error('CloseHandle', api.getLastError(), 'current process token after init failure'))
@@ -319,6 +360,7 @@ export class AclSandbox {
       for (const grant of this.grantedPaths) {
         try {
           revokeWrite(api, grant.path, grant.sidPtr)
+          grant.lease.release()
         } catch (cleanupError) {
           cleanupFailures.push(cleanupError)
         }
@@ -401,9 +443,36 @@ export class AclSandbox {
   }
 
   /**
-   * Revoke the revocable (temp) grants, free the SID, close the token; the
-   * standing workspace ACEs stay (the reuse cache). Reports every cleanup
-   * failure.
+   * Take the private temp directory's lease and grant it: the lease is what
+   * authorizes the revoke at dispose, and it is recorded before the grant so a
+   * post-apply throw still leaves a revocable record. A directory a LIVE
+   * process already owns is granted idempotently (the exact-ACE skip) and left
+   * to that owner.
+   * @param api - the binding table.
+   * @param path - the private temp directory to grant.
+   * @param sid - the capability SID string the lease records.
+   * @param sidPtr - the parsed capability SID the ACE names.
+   * @param lowLabelSid - the Low integrity SID the mandatory label names.
+   * @param worldSid - the Everyone SID the ambient-delete deny names.
+   */
+  private leaseAndGrant(
+    api: Win32Bindings,
+    path: string,
+    sid: string,
+    sidPtr: NativePtr,
+    lowLabelSid: NativePtr,
+    worldSid: NativePtr,
+  ): void {
+    const lease = holdGrantLease(api, path, sid)
+    if (lease !== null) this.grantedPaths.push({ path, sidPtr, lease })
+    grantWrite(api, path, sidPtr, lowLabelSid, worldSid)
+  }
+
+  /**
+   * Revoke every grant this instance owns (freeing the shared Low label where
+   * no other capability grant remains), free the SIDs, close the token.
+   * Reports every cleanup failure; a lease whose revoke failed stays held, so
+   * the journal sweep reclaims that directory after this process exits.
    */
   dispose(): void {
     const api = this.api
@@ -413,6 +482,7 @@ export class AclSandbox {
       for (const grant of this.grantedPaths) {
         try {
           revokeWrite(api, grant.path, grant.sidPtr)
+          grant.lease.release()
         } catch (error) {
           failures.push(error)
         }

@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-sandbox-local` confines commands and their descendants on Linux, macOS, and Windows while sharing the host kernel and filesystem. It chooses a supported platform runner automatically and fails with `SANDBOX_UNAVAILABLE` when none is usable, so commands never silently run without confinement. Each execution reports `full` or `partial` enforcement plus denial and runner-failure signatures, allowing callers to distinguish an unavailable or broken sandbox from a policy denial. Choose it for host-local bash or pwsh execution; use a container or remote executor when the process needs an isolated environment.
+`dsh-sandbox-local` confines commands and their descendants on Linux, macOS, and Windows while sharing the host kernel and filesystem. It chooses a supported platform runner automatically and fails with `SANDBOX_UNAVAILABLE` when none is usable; only the explicit `backend: 'noop'` configuration returns an unwrapped argv, reporting that nothing is enforced. Each execution reports `full` or `partial` enforcement plus denial and runner-failure signatures, letting callers distinguish an unavailable or broken sandbox from a policy denial. Choose it for host-local bash or pwsh execution; use a container or remote executor when the process needs an isolated environment.
 
 ## Table of Contents
 
@@ -42,11 +42,18 @@ Load the sandbox service and mount the provider; the defaults below are the sele
 
 | Field | Default | Meaning |
 |---|---|---|
+| `backend` | `'auto'` | `auto` walks this platform's runner chain; `noop` spawns the caller's argv unchanged (see [No-op backend](#no-op-backend)) |
 | `runnerCommand` | `[]` | Custom runner argv; bwrap-compatible profile arguments are appended, full enforcement is asserted, and built-in selection and probes are skipped |
 | `runnerFailureSignatures` | `[]` | Case-insensitive stderr substrings identifying the custom runner's own failure dialect; required with `runnerCommand` |
 | `probeTimeoutMs` | `5,000` | Timeout for each functional probe of a competing runner candidate |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-sandbox-local) is the exhaustive source for every accepted field and its JSDoc.
+
+### No-op backend
+
+<a id="no-op-backend"></a>
+
+`backend: 'noop'` is for a host whose platform runner is unavailable or unacceptable to the operator: it keeps the policy surfaces — the resolved mode the callers and the model see, permission presets, and the sandboxed filesystem provider's own checks — and drops the OS mechanism. Every call spawns the caller's argv directly, so no runner process, no restricted token, and no NTFS SACL or integrity-label write happens; the provider neither sweeps nor materializes the Windows write grants, so a child keeps the ambient `TMP`/`TEMP` instead of a private per-session directory. Each wrap reports `partial` enforcement with an empty denial dialect and no runner-failure rule, because no promised file effect is governed; a startup warning names the choice. Deployments that need confinement at all keep `auto`: `noop` is a deliberate, visible downgrade, never a fallback the provider chooses for itself.
 
 ### Confined execution and enforcement
 
@@ -68,7 +75,7 @@ This section explains runner selection, the per-platform profiles, and the failu
 
 ### Runner selection
 
-Selection is by platform first, probes second: each platform has a runner chain (`linux`: `bwrap` then Landlock; `darwin`: Seatbelt; `win32`: the ACL restricted-token runner). A sole candidate is selected without a probe; competing candidates are functionally probed once in chain order, and the first usable verdict is cached for the provider's lifetime. A platform with no chain, or a chain where every probe fails, is unavailable and fails closed at `confine()`.
+Selection is by platform first, probes second: each platform has a runner chain (`linux`: `bwrap` then Landlock; `darwin`: Seatbelt; `win32`: the ACL restricted-token runner). A sole candidate is selected without a probe; competing candidates are functionally probed once in chain order, and the first usable verdict is cached for the provider's lifetime. A platform with no chain, or a chain where every probe fails, is unavailable and fails closed at `confine()`. `backend: 'noop'` skips selection entirely: the provider holds no runner, caches no verdict, and keeps no write grant.
 
 ### Platform profiles
 
@@ -90,7 +97,7 @@ Each runner's kernel speaks its own denial dialect, carried on every wrap as `de
 
 | File | Role |
 |---|---|
-| [`src/index.ts`](src/index.ts) | Plugin entry: runner chain selection, functional probes, per-call wrap, ACL grant lifecycle |
+| [`src/index.ts`](src/index.ts) | Plugin entry: backend selection, runner chain selection, functional probes, per-call wrap, ACL grant lifecycle |
 | [`src/profiles.ts`](src/profiles.ts) | Per-platform profile builders: bwrap mounts, Landlock grants, Seatbelt SBPL |
 | — | No runtime invariant companion is published; this package exposes no independent event sequence or mutable data relation beyond contracts enforced at its owning seam. |
 
@@ -128,6 +135,7 @@ No direct invalidation; the named consumers own any request-prefix changes.
 These limits define when the provider is a poor fit or needs special operational care. They are current package constraints, not a general platform comparison or a task backlog.
 
 - **Windows ACL enforcement is partial** — NTFS hard links alias one file object across workspace and external paths, reads stay unconfined, and a tree another AppContainer tool has ACL'd with a package SID is unreadable to the Low-integrity child. The provider reports `enforcement: 'partial'` rather than overstating that boundary as full.
+- **`backend: 'noop'` enforces nothing** — every confined call runs the caller's argv unconfined while still reporting the policy's mode, so a deployment that selects it has the policy surfaces without the file-effect boundary. It is reported as `partial` rather than `full`, which is the only signal a consumer gets that no promised file effect is governed.
 - **Landlock may be partial** — older supported kernel ABIs confine only the access classes they expose, reported as `enforcement: 'partial'` rather than overstated as full.
 - **Seatbelt depends on deprecated `sandbox-exec`** — macOS still ships it, but this provider cannot replace or probe that private policy engine if Apple removes it.
 - **Runner selection is cached for the provider lifetime** — installing, removing, or repairing a runner requires reloading the plugin before selection changes.

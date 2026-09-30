@@ -8,7 +8,7 @@
  * acl.spec.ts and runner.spec.ts (win32 only).
  */
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Win32Error } from '@deepseek-ai/dsh-win32-process'
@@ -90,7 +90,12 @@ function happyStubs(): HappyStubs {
     buffer.write(temp, 'utf16le')
     return temp.length
   })
-  const createFileW = vi.fn(() => fresh())
+  const createFileW = vi.fn((fileName: string) => {
+    // Pure FFI stubs, but a grant lease's journal record is a REAL file: create
+    // it so the module's read/write round trip has something to open.
+    writeFileSync(fileName, '')
+    return fresh()
+  })
   const getNamedSecurityInfoW = vi.fn((
     _path: unknown, _type: unknown, _info: unknown, _owner: unknown, _group: unknown,
     dacl: NativePtr, sacl: NativePtr, descriptor: NativePtr,

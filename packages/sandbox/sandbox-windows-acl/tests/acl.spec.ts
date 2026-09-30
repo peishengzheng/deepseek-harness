@@ -364,16 +364,16 @@ describe.skipIf(!isWin32)('ACL editing', () => {
     }
   })
 
-  it('interleaved sandbox instances: A.init → B.init → A.dispose → B.dispose leaves BOTH standing workspace ACEs (the per-workspace reuse cache)', async () => {
+  it('interleaved sandbox instances: A.init → B.init → A.dispose → B.dispose leaves BOTH standing workspace ACEs (one workspace grant per command, never re-propagated)', async () => {
     const api = await win32()
     const dir = scratch()
     const sandboxA = new AclSandbox({ writableDirs: [dir], tempDir: null, writeSid: 'S-1-4-9000-1', mode: 'workspace-write' })
     const sandboxB = new AclSandbox({ writableDirs: [dir], tempDir: null, writeSid: 'S-1-4-9000-2', mode: 'workspace-write' })
     await sandboxA.init()
     await sandboxB.init()
-    // Workspace ACEs are STANDING: dispose frees the instance's SID
-    // allocations but deliberately leaves the ACEs — they are the reuse
-    // cache the next provision's exact-ACE skip consumes.
+    // Workspace ACEs are STANDING: the second init reuses the directory it
+    // already owns, dispose frees the instance's own allocations, and neither
+    // command re-propagates the tree for the other.
     sandboxA.dispose()
     sandboxB.dispose()
     const aces = readDirectAces(api, dir)

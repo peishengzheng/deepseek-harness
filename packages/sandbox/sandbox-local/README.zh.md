@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`dsh-sandbox-local` 在共享宿主内核和文件系统的同时，限制 Linux、macOS 与 Windows 上的命令及其派生进程。它自动选择受支持的平台 runner；没有可用 runner 时以 `SANDBOX_UNAVAILABLE` 失败，因此命令绝不会静默无限制运行。每次执行都会报告 `full` 或 `partial` 强制执行，以及拒绝和 runner 失败签名，让调用方能区分不可用或损坏的沙箱与策略拒绝。宿主本地 bash 或 pwsh 执行适合选择它；进程需要隔离环境时应改用容器或远程执行器。
+`dsh-sandbox-local` 在共享宿主内核和文件系统的同时，限制 Linux、macOS 与 Windows 上的命令及其派生进程。它自动选择受支持的平台 runner；没有可用 runner 时以 `SANDBOX_UNAVAILABLE` 失败，因此命令绝不会静默无限制运行；只有显式的 `backend: 'noop'` 配置才返回未包装的 argv，并如实报告由此产生的强制缺口。每次执行都会报告 `full` 或 `partial` 强制执行，以及拒绝和 runner 失败签名，让调用方能区分不可用或损坏的沙箱与策略拒绝。宿主本地 bash 或 pwsh 执行适合选择它；进程需要隔离环境时应改用容器或远程执行器。
 
 ## 目录
 
@@ -42,11 +42,18 @@ kind: "package-reference"
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
+| `backend` | `'auto'` | `auto` 走本平台的 runner 链；`noop` 原样 spawn 调用方 argv（见 [noop 后端](#no-op-backend)） |
 | `runnerCommand` | `[]` | 自定义 runner argv；会追加 bwrap 兼容的 profile 参数，断言完全强制执行，并跳过内置选择与探测 |
 | `runnerFailureSignatures` | `[]` | 识别自定义 runner 自身失败方言的不区分大小写 stderr 子串；与 `runnerCommand` 搭配必需 |
 | `probeTimeoutMs` | `5,000` | 每次竞争 runner 候选功能探测的超时时间 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-sandbox-local)是每个受支持字段及其 JSDoc 的穷尽式真源。
+
+### noop 后端
+
+<a id="no-op-backend"></a>
+
+`backend: 'noop'` 面向平台 runner 不可用或操作方不接受的宿主：它保留策略面——调用方与模型看到的已解析模式、权限预设、以及沙箱化文件系统提供方自身的检查——而去掉操作系统机制。每次调用都直接 spawn 调用方 argv，因此不会产生 runner 进程、受限令牌，也不会写入 NTFS SACL 或完整性标签；提供方既不清理也不物化 Windows 写入授权，因此子进程沿用环境中的 `TMP`/`TEMP`，而不再获得按会话的私有目录。每次包装都报告 `partial` 强制执行、空拒绝方言与无 runner 失败规则，因为没有任何承诺的文件操作真正被管辖；启动时会有一条警告说明该选择。需要任何真实隔离的部署都应保留 `auto`：`noop` 是显式、可见的降级，绝不是提供方自行选择的回退。
 
 ### 受限执行与强制执行
 
@@ -68,7 +75,7 @@ kind: "package-reference"
 
 ### runner 选择
 
-选择按平台优先、探测其次：每个平台都有 runner 链（`linux`：`bwrap` 再 Landlock；`darwin`：Seatbelt；`win32`：ACL 受限令牌 runner）。唯一候选直接选择、不探测；竞争候选按链序各执行一次功能探测，首个可用结论在提供方生命周期内缓存。没有链的平台、或链上所有探测都失败时，平台不可用，`confine()` 会拒绝执行。
+选择按平台优先、探测其次：每个平台都有 runner 链（`linux`：`bwrap` 再 Landlock；`darwin`：Seatbelt；`win32`：ACL 受限令牌 runner）。唯一候选直接选择、不探测；竞争候选按链序各执行一次功能探测，首个可用结论在提供方生命周期内缓存。没有链的平台、或链上所有探测都失败时，平台不可用，`confine()` 会拒绝执行。`backend: 'noop'` 完全跳过选择：提供方不持有 runner、不缓存结论，也不保留任何写入授权。
 
 ### 平台 profile
 
@@ -90,7 +97,7 @@ Windows 档为每个工作区保留一个确定性写入 SID 和常驻 ACE，同
 
 | 文件 | 职责 |
 |---|---|
-| [`src/index.ts`](src/index.ts) | 插件入口：runner 链选择、功能探测、逐调用包装、ACL 授权生命周期 |
+| [`src/index.ts`](src/index.ts) | 插件入口：后端选择、runner 链选择、功能探测、逐调用包装、ACL 授权生命周期 |
 | [`src/profiles.ts`](src/profiles.ts) | 各平台 profile 构建器：bwrap 挂载、Landlock 授权、Seatbelt SBPL |
 | — | 不发布运行时不变式伴生入口；除所属 seam 强制执行的约定外，本包不公开独立的事件序列或可变数据关系。 |
 
@@ -128,6 +135,7 @@ Windows 档为每个工作区保留一个确定性写入 SID 和常驻 ACE，同
 这些限制说明提供方何时不合适，或何时需要特别运维。它们是当前包约束，不是通用平台对比或任务积压。
 
 - **Windows ACL 只能实现部分强制执行**——NTFS 硬链接会使工作区路径与外部路径指向同一个文件对象，读取仍不受限，且被其他 AppContainer 工具以包 SID 标记过的目录树对 Low 完整性子进程不可读。提供方报告 `enforcement: 'partial'`，而不会把该边界夸大为完整强制执行。
+- **`backend: 'noop'` 不强制任何东西**——每次受限调用都让调用方 argv 不受限运行，却仍报告策略的模式，因此选择它的部署只有策略面而没有文件效果边界。它按 `partial` 而非 `full` 报告，这是消费方得知没有任何承诺文件操作被管辖的唯一信号。
 - **Landlock 可能只实现部分强制执行**——较旧且受支持的内核 ABI 只能限制自身公开的访问类别，因此报告 `enforcement: 'partial'`，不会夸大为完整强制执行。
 - **Seatbelt 依赖已弃用的 `sandbox-exec`**——macOS 仍会提供它，但若 Apple 移除该私有策略引擎，该提供方无法替换或探测。
 - **runner 选择在提供方生命周期内缓存**——安装、移除或修复 runner 后，必须重载插件才能改变选择。

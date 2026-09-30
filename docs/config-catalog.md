@@ -2427,11 +2427,23 @@ export interface Config {
 
 ## `@deepseek-ai/dsh-sandbox-local`
 
-- `source`: [`packages/sandbox/sandbox-local/src/index.ts:45`](../packages/sandbox/sandbox-local/src/index.ts)
+- `source`: [`packages/sandbox/sandbox-local/src/index.ts:52`](../packages/sandbox/sandbox-local/src/index.ts)
 
 ```ts config-catalog
 /** Plugin config. All optional — `static Config` supplies the defaults. */
 export interface Config {
+  /**
+   * Which confinement the provider applies. `auto` (default) walks this
+   * platform's runner chain. `noop` spawns the caller's argv unchanged: no
+   * runner process, no restricted token, and no NTFS SACL or integrity-label
+   * write. Logical policy is unaffected — the resolved mode, the permission
+   * presets, and the sandboxed filesystem provider's own checks still apply —
+   * but no OS mechanism enforces it, so every wrap reports `partial` and
+   * carries no denial dialect and no runner-failure rule. Published
+   * deployments keep `auto`; `noop` exists for a host whose platform runner is
+   * unavailable or unacceptable to the operator.
+   */
+  backend?: 'auto' | 'noop'
   /**
    * Override the runner argv; bwrap-compatible profile arguments are appended. A
    * non-empty override asserts full enforcement and skips built-in selection and

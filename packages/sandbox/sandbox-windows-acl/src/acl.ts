@@ -22,7 +22,8 @@
  */
 
 import { createHash } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { allocOverlapped, allocPtrSlot, decodePtr, decodeUint8At, decodeUint16At, decodeUint32At, getTempPath, isInvalidHandle, isNullPtr, ptrAddress, sameSidAt, throwLastError, throwWin32 } from './ffi.ts'
@@ -444,5 +445,157 @@ export function revokeWrite(api: Win32Bindings, path: string, sidPtr: NativePtr)
       descriptor, 'revokeWrite',
     )
     return true
+  })
+}
+
+/** One `fullTreeCleanup` pass outcome. */
+export interface TreeCleanupResult {
+  /** Objects the pass visited (the root, every descendant directory, and every regular file). */
+  readonly visited: number
+  /** Objects that carried the capability ACE or a mandatory label and lost it. */
+  readonly cleaned: readonly string[]
+  /** Per-object failures; the pass continues past each one. */
+  readonly failures: readonly unknown[]
+}
+
+/**
+ * True when the ACL carries an allowed ACE for `sidPtr` with the grant mask,
+ * inherited entries included.
+ * @param acl - the object's DACL.
+ * @param sidPtr - the capability SID to look for.
+ * @returns whether a grant ACE for that SID is present.
+ */
+function hasGrantAce(acl: NativePtr, sidPtr: NativePtr): boolean {
+  const aclSize = decodeUint16At(acl, 2)
+  const aceCount = decodeUint16At(acl, 4)
+  if (aclSize < 8 || aclSize > 1_048_576) return false
+  let offset = 8
+  for (let index = 0; index < aceCount; index++) {
+    const aceSize = decodeUint16At(acl, offset + 2)
+    if (aceSize < 8 || offset + aceSize > aclSize) return false
+    if (decodeUint8At(acl, offset) === abi.ACCESS_ALLOWED_ACE_TYPE
+      && decodeUint32At(acl, offset + 4) === abi.GRANT_MASK
+      && sameSidAt(acl, offset + 8, sidPtr, 0)) return true
+    offset += aceSize
+  }
+  return false
+}
+
+/**
+ * True when the label ACL carries any mandatory-integrity ACE.
+ * @param labelAcl - the object's label ACL.
+ * @returns whether a mandatory label entry is present.
+ */
+function hasMandatoryLabelAce(labelAcl: NativePtr): boolean {
+  const aclSize = decodeUint16At(labelAcl, 2)
+  const aceCount = decodeUint16At(labelAcl, 4)
+  if (aclSize < 8 || aclSize > 1_048_576) return false
+  let offset = 8
+  for (let index = 0; index < aceCount; index++) {
+    const aceSize = decodeUint16At(labelAcl, offset + 2)
+    if (aceSize < 8 || offset + aceSize > aclSize) return false
+    if (decodeUint8At(labelAcl, offset) === abi.SYSTEM_MANDATORY_LABEL_ACE_TYPE) return true
+    offset += aceSize
+  }
+  return false
+}
+
+/**
+ * Clear one object's capability ACEs and mandatory label, reporting whether it
+ * carried either. Nothing is written for an object that carries neither, which
+ * is what makes a repeated pass over a cleaned tree a read-only no-op. A NULL
+ * DACL keeps its "everyone full control" meaning: only the label is cleared.
+ *
+ * The caller holds the pass's lock (see {@link fullTreeCleanup}), so this
+ * performs the merge directly rather than through {@link revokeWrite}, whose
+ * own per-path lock would conflict with it.
+ * @param api - the binding table.
+ * @param path - the object to clear.
+ * @param sidPtr - the capability SID whose ACEs are revoked.
+ * @returns whether the object carried a grant ACE or a mandatory label.
+ */
+function clearObjectSecurity(api: Win32Bindings, path: string, sidPtr: NativePtr): boolean {
+  const { oldAcl, labelAcl, descriptor } = readCurrentSecurity(api, path)
+  const carries = (oldAcl !== null && hasGrantAce(oldAcl, sidPtr))
+    || (labelAcl !== null && hasMandatoryLabelAce(labelAcl))
+  if (!carries) {
+    if (descriptor !== null) {
+      const freed = api.localFree(descriptor)
+      if (!isNullPtr(freed)) throwLastError(api, 'LocalFree', `fullTreeCleanup(${path}) descriptor`)
+    }
+    return false
+  }
+  if (oldAcl === null) {
+    if (descriptor !== null) {
+      const freed = api.localFree(descriptor)
+      if (!isNullPtr(freed)) throwLastError(api, 'LocalFree', `fullTreeCleanup(${path}) descriptor`)
+    }
+    const applied = api.setNamedSecurityInfoW(
+      path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null, null,
+    )
+    if (applied !== abi.ERROR_SUCCESS) throwWin32(api, 'SetNamedSecurityInfoW', applied, `fullTreeCleanup(${path})`)
+    return true
+  }
+  mergeAndApply(
+    api, path, buildExplicitAccess(sidPtr, abi.REVOKE_ACCESS, 0), oldAcl,
+    { kind: 'clear' }, descriptor, 'fullTreeCleanup',
+  )
+  return true
+}
+
+/**
+ * Clear the capability ACEs and mandatory labels of one granted tree, on
+ * demand. This is the manual counterpart of the grant's own disposal: the exit
+ * path never calls it. Every object below `root` is visited — a security
+ * descriptor write on a directory makes Windows propagate inherited entries to
+ * its descendants anyway, so this pass exists for the objects that carry
+ * EXPLICIT entries another tool stamped, and for clearing a tree without
+ * restarting the sandbox.
+ *
+ * The whole pass runs under the root's cross-process lock, so two cleanups (or
+ * a cleanup and a grant) cannot interleave their descriptor merges. Failures
+ * are collected per object rather than thrown: an unreadable subdirectory stops
+ * that branch, not the pass. Repeating the call over a cleaned tree reports no
+ * cleaned objects and no failures.
+ * @param api - the binding table.
+ * @param root - the granted directory to clean.
+ * @param sidPtr - the capability SID whose ACEs are revoked.
+ * @returns the visited count, the cleaned objects, and every per-object failure.
+ */
+export function fullTreeCleanup(api: Win32Bindings, root: string, sidPtr: NativePtr): TreeCleanupResult {
+  const cleaned: string[] = []
+  const failures: unknown[] = []
+  let visited = 0
+  if (!existsSync(root)) {
+    failures.push(new Error(`fullTreeCleanup root does not exist: ${root}`))
+    return { visited, cleaned, failures }
+  }
+  const visitObject = (path: string): void => {
+    visited += 1
+    try {
+      if (clearObjectSecurity(api, path, sidPtr)) cleaned.push(path)
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  return withPathLock(api, root, () => {
+    const walk = (path: string): void => {
+      visitObject(path)
+      let entries: Dirent<string>[]
+      try {
+        entries = readdirSync(path, { withFileTypes: true })
+      } catch (error) {
+        failures.push(error) // unreadable directory: nothing below it can be visited
+        return
+      }
+      for (const entry of entries) {
+        const child = join(path, entry.name)
+        // Reparse points are skipped: following them would leave the granted root.
+        if (entry.isDirectory()) walk(child)
+        else if (entry.isFile()) visitObject(child)
+      }
+    }
+    walk(root)
+    return { visited, cleaned, failures }
   })
 }

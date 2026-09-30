@@ -1,33 +1,45 @@
 /**
- * Server-side write-grant materialization. The sandbox seam holds one
- * standing workspace grant per workspace and one revocable temp grant per
- * live session/workspace pair. Workspace identities survive by deterministic
- * derivation and their standing ACE; temp identities derive from random
- * private paths and are deliberately new after a restart.
+ * Server-side write-grant materialization. One instance covers one capability
+ * SID: `add` records a directory whose ACEs and Low label the instance then
+ * owns, and `dispose` revokes the paths it owns — which clears the shared
+ * label once no other capability grant remains on the directory.
+ *
+ * Ownership is per directory and per process. A revocable `add` takes the
+ * directory's lease first ({@link holdGrantLease}); a caller that cannot take
+ * it found a live owner and never revokes that directory, so two sandbox
+ * instances sharing one workspace cannot revoke each other's capability. A
+ * standing path is the caller's declared reuse cache: it is never revoked.
  *
  * Fail-closed: `add` throws on any grant failure and the caller disposes the
- * instance (revoking every path granted so far); `dispose` revokes every
- * revocable grant, leaves the standing workspace edits in place, and reports
- * every cleanup failure.
+ * instance (revoking every path granted so far); `dispose` reports every
+ * cleanup failure. The lease of a path whose revoke failed is deliberately
+ * kept, so the journal sweep reclaims it after this process exits.
  * @module @deepseek-ai/dsh-sandbox-windows-acl/grant
  */
 
 import { grantWrite, revokeWrite } from './acl.ts'
 import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, win32Sync } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
+import { holdGrantLease } from './grant-journal.ts'
+import type { GrantLease } from './grant-journal.ts'
 import { makeWellKnownSid } from './token.ts'
 import * as abi from './win32-abi.ts'
 
+/** One revocable grant: the directory plus the lease marking this process its owner. */
+interface RevocableGrant {
+  readonly path: string
+  readonly lease: GrantLease
+}
+
 /**
- * One write SID's provider-lifetime grant materialization: the parsed SID
- * pointer plus every directory whose DACL currently carries its ACE and whose
- * label ACL carries the Low mandatory label. Workspace paths are added
- * STANDING (their security descriptor edits are the cross-session reuse cache
- * and outlive the grant — dispose() skips revoking them, or the next
- * provision would re-propagate the whole tree); temp paths are revocable
- * (dispose() revokes them — an inheritable ACE must not outlive its
- * session's temp directory). Create with {@link AclWriteGrant.create};
- * dispose revokes the revocable paths and frees every SID.
+ * One write SID's grant materialization: the parsed SID pointer plus every
+ * directory whose DACL currently carries its ACE and whose label ACL carries
+ * the Low mandatory label. Revocable paths are owned by this instance: its
+ * lease on each directory is what authorizes the revoke at dispose, and a
+ * directory another live process already owns is recorded as foreign and left
+ * untouched. Standing paths are the caller's reuse cache and outlive the
+ * instance. Create with {@link AclWriteGrant.create}; dispose revokes the
+ * revocable paths and frees every SID.
  */
 export class AclWriteGrant {
   /** The write SID in SDDL string form. */
@@ -36,8 +48,9 @@ export class AclWriteGrant {
   private readonly sidPtr: NativePtr
   private readonly lowLabelSidPtr: NativePtr
   private readonly worldSidPtr: NativePtr
-  private readonly revocablePaths: string[] = []
+  private readonly revocable: RevocableGrant[] = []
   private readonly standingPaths: string[] = []
+  private readonly foreignPaths: string[] = []
 
   private constructor(
     api: Win32Bindings,
@@ -90,34 +103,51 @@ export class AclWriteGrant {
   /**
    * Grant the write ACE, the ambient-delete deny, and the Low mandatory label
    * on one directory (idempotent: an already-standing exact ACE, deny, and
-   * label skip the eager full-tree re-propagation — see {@link grantWrite})
-   * and record the path for {@link dispose} unless it is standing. The path is
-   * recorded BEFORE the grant: a post-apply throw (a LocalFree failure after
-   * SetNamedSecurityInfoW succeeded) must still revoke it, and revoking an
-   * ungranted path is a no-op merge. Callers treat a throw as a failed
-   * materialization and dispose the instance to revoke the paths granted so
-   * far.
+   * label skip the eager full-tree re-propagation — see {@link grantWrite}).
+   *
+   * A revocable add takes the directory's lease BEFORE the grant: a post-apply
+   * throw (a LocalFree failure after SetNamedSecurityInfoW succeeded) must
+   * still revoke it, and revoking an ungranted path is a no-op merge. A
+   * directory whose lease another live process holds is recorded as foreign
+   * and never revoked by this instance; re-adding a directory this instance
+   * already owns reuses its lease instead of opening a second one.
    * @param path - the directory whose DACL and label gain the grant.
-   * @param standing - the edits outlive this grant (the workspace reuse
-   *   cache; dispose() skips revoking it). Default false (revoked on
-   *   dispose — the temp-directory lifecycle).
+   * @param standing - the edits outlive this instance (the caller's reuse
+   *   cache; dispose() skips revoking it). Default false (revoked on dispose).
    */
   add(path: string, standing = false): void {
-    ;(standing ? this.standingPaths : this.revocablePaths).push(path)
+    if (standing) {
+      this.standingPaths.push(path)
+      grantWrite(this.api, path, this.sidPtr, this.lowLabelSidPtr, this.worldSidPtr)
+      return
+    }
+    const owned = this.revocable.find(entry => entry.path === path)
+    const lease = owned?.lease ?? holdGrantLease(this.api, path, this.writeSid)
+    if (lease === null) {
+      if (!this.foreignPaths.includes(path)) this.foreignPaths.push(path)
+    } else if (owned === undefined) {
+      this.revocable.push({ path, lease })
+    }
     grantWrite(this.api, path, this.sidPtr, this.lowLabelSidPtr, this.worldSidPtr)
   }
 
-  /** Every directory currently carrying the grant, in grant order. */
+  /** Every directory currently carrying the grant, in grant order (standing, owned revocable, then foreign). */
   get paths(): readonly string[] {
-    return [...this.standingPaths, ...this.revocablePaths]
+    return [...this.standingPaths, ...this.revocable.map(entry => entry.path), ...this.foreignPaths]
   }
 
-  /** Revoke every revocable grant (standing security descriptor edits stay) and free the SIDs; reports every cleanup failure. */
+  /**
+   * Revoke every owned revocable grant (standing and foreign security
+   * descriptor edits stay) and free the SIDs; reports every cleanup failure.
+   * A lease survives a failed revoke, so the journal sweep reclaims that
+   * directory after this process exits.
+   */
   dispose(): void {
     const failures: unknown[] = []
-    for (const path of this.revocablePaths) {
+    for (const entry of this.revocable) {
       try {
-        revokeWrite(this.api, path, this.sidPtr)
+        revokeWrite(this.api, entry.path, this.sidPtr)
+        entry.lease.release()
       } catch (error) {
         failures.push(error)
       }

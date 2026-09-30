@@ -3,21 +3,27 @@
  * Landlock; macOS Seatbelt; Windows the ACL restricted-token runner), functionally probes
  * competing candidates once, and reports each wrap's enforcement and stderr
  * classification facts. Missing or unusable confinement fails closed rather
- * than returning the original argv.
+ * than returning the original argv; only the explicit `backend: 'noop'`
+ * configuration returns an unwrapped argv, and it reports the resulting
+ * absence of enforcement instead of claiming it.
  *
  * The windows-acl rung additionally owns the write grants: the write SID is
  * the per-WORKSPACE identity derived from the canonical workspace path
  * (`workspaceWriteSid`), while every live session receives a RANDOM private
- * temp directory and its own derived capability (`tempWriteSid`). The
- * workspace-root ACE materializes once per workspace per server lifetime
- * and STANDS (the cross-session reuse cache — the exact-ACE skip makes
- * every later provision O(1) instead of re-propagating the tree per
- * session); the private-temp ACEs are revoked on dispose. The runner
- * receives both SIDs (their presence marks the seam-managed contract) and
- * stops managing DACLs itself. The rung reports partial enforcement because
- * NTFS hard links alias one file object across paths, reads stay unconfined,
- * and a tree another AppContainer tool has ACL'd with a package SID is not
- * readable by the Low-integrity child.
+ * temp directory and its own derived capability (`tempWriteSid`). Every grant
+ * is materialized once per provider and revoked in ONE disposal pass when the
+ * DSH host exits — never per session and never per command, because one
+ * security-descriptor write on a directory walks its descendants whatever the
+ * inheritance flags. The pass also clears the shared Low label the workspace
+ * grant applied; a provider start first sweeps records an unclean earlier exit
+ * left behind ({@link sweepStaleGrantLeases}). The runner receives both SIDs
+ * (their presence marks the seam-managed contract) and stops managing DACLs
+ * itself; only an agentless call — one with no session to key a capability on —
+ * leaves its random private temp directory to the runner's own command-scoped
+ * lifecycle. The rung reports partial enforcement because NTFS hard links
+ * alias one file object across paths, reads stay unconfined, and a tree
+ * another AppContainer tool has ACL'd with a package SID is not readable by
+ * the Low-integrity child.
  * @module @deepseek-ai/dsh-sandbox-local
  */
 
@@ -37,12 +43,51 @@ import z from '@deepseek-ai/schemastery'
 import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, ConfinedSandboxMode, RunnerFailureRule, SandboxEnforcement, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { AclWriteGrant, assertTempRootOutsideWorkspace, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl'
+import { AclWriteGrant, assertTempRootOutsideWorkspace, cleanWorkspaceTree, sweepStaleGrantLeases, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl'
+import type { GrantSweepResult } from '@deepseek-ai/dsh-sandbox-windows-acl'
+
+/**
+ * The command-registrar shape this plugin uses. The commands service is
+ * optional and owned by another package, so the plugin narrows it structurally
+ * instead of depending on it.
+ */
+interface CommandRegistrar {
+  register(definition: {
+    readonly name: string
+    readonly description: string
+    readonly handler: () => { readonly kind: 'success'; readonly text: string }
+  }): () => void
+}
+
+/**
+ * Resolve the optional commands service as the registrar this plugin needs.
+ * @param ctx - the provider's context.
+ * @returns the registrar, or undefined when this composition mounts no commands service.
+ */
+function commandRegistrar(ctx: Context): CommandRegistrar | undefined {
+  const commands: unknown = ctx.get('commands')
+  if (typeof commands !== 'object' || commands === null) return undefined
+  const register = (commands as { register?: unknown }).register
+  if (typeof register !== 'function') return undefined
+  return commands as CommandRegistrar
+}
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import { bwrapProfileArgs, landlockProfileArgs, seatbeltProfileArgs } from './profiles.ts'
 
 /** Plugin config. All optional — `static Config` supplies the defaults. */
 export interface Config {
+  /**
+   * Which confinement the provider applies. `auto` (default) walks this
+   * platform's runner chain. `noop` spawns the caller's argv unchanged: no
+   * runner process, no restricted token, and no NTFS SACL or integrity-label
+   * write. Logical policy is unaffected — the resolved mode, the permission
+   * presets, and the sandboxed filesystem provider's own checks still apply —
+   * but no OS mechanism enforces it, so every wrap reports `partial` and
+   * carries no denial dialect and no runner-failure rule. Published
+   * deployments keep `auto`; `noop` exists for a host whose platform runner is
+   * unavailable or unacceptable to the operator.
+   */
+  backend?: 'auto' | 'noop'
   /**
    * Override the runner argv; bwrap-compatible profile arguments are appended. A
    * non-empty override asserts full enforcement and skips built-in selection and
@@ -136,6 +181,8 @@ export interface SandboxInternals {
   probeWindowsAcl?: () => boolean
   /** Replaces the private-temp-directory removal at provider dispose (a throwing fake exercises the cleanup-failure path). */
   rmTempDir?: (path: string) => void
+  /** Replaces the startup reclaim of stale windows-acl grants (a fake reports the failure path). */
+  sweepStaleGrants?: () => GrantSweepResult
 }
 
 /** The chain's verdict: which runner confines, and how completely it enforces. */
@@ -244,14 +291,16 @@ const RUNNER_FAILURE_RULES = {
 /**
  * Local process-sandbox provider. Registers as `ctx.sandbox`. Caches the
  * chain verdict and, on the windows-acl rung, the write grants
- * ({@link AclWriteGrant}: the standing workspace-root grant per workspace
- * and the revocable private-temp grant per live session/workspace pair, the
- * latter revoked on provider dispose); the one-time probes spawn nothing
- * else.
+ * ({@link AclWriteGrant}: one workspace-root grant per workspace and one
+ * private-temp grant per live session/workspace pair). Every grant survives
+ * the sessions that use it and is revoked in one pass at provider dispose —
+ * the DSH host's exit; the one-time probes spawn nothing else. The
+ * `backend: 'noop'` configuration caches and materializes none of it.
  */
 export class LocalSandboxProvider extends SandboxProvider {
   // Inline schema call: the config catalog walks `static Config` statically.
   static Config: z<Config> = z.object({
+    backend: z.union(['auto', 'noop']).default('auto'),
     runnerCommand: z.array(z.string()).default([]),
     runnerFailureSignatures: z.array(z.string()).default([]),
     probeTimeoutMs: z.natural().default(5_000),
@@ -260,17 +309,17 @@ export class LocalSandboxProvider extends SandboxProvider {
   /** Test hook (mirrors the bash executors' `internals`). */
   internals: SandboxInternals = {}
 
+  private readonly backend: 'auto' | 'noop'
   private readonly runnerCommand: string[] | undefined
   private readonly configuredRunnerFailureSignatures: string[]
   private readonly probeTimeoutMs: number
   /** Cached chain verdict; undefined until the first confined wrap needs it. */
   private selectedRunner: SelectedRunner | 'unavailable' | undefined
   /**
-   * Server-lifetime write grants (windows-acl rung): the STANDING
-   * workspace-root grant per workspace (its ACE is the cross-session reuse
-   * cache and outlives the provider — never revoked) and the REVOCABLE
-   * private-temp grant per live session/workspace pair (revoked on provider
-   * dispose).
+   * Provider-lifetime write grants (windows-acl rung): one grant per
+   * workspace root and one per live session/workspace temp capability, each
+   * holding the directory's lease so this provider is the process that
+   * revokes it (and clears the shared Low label) at dispose.
    */
   private readonly workspaceGrants = new Map<string, AclWriteGrant>()
   private readonly tempCapabilities = new Map<string, AclTempCapability>()
@@ -282,6 +331,10 @@ export class LocalSandboxProvider extends SandboxProvider {
     // use the platform chain.
     const runner = config.runnerCommand as string[]
     const runnerFailureSignatures = config.runnerFailureSignatures as string[]
+    const backend = config.backend as 'auto' | 'noop'
+    if (backend === 'noop' && runner.length > 0) {
+      throw new Error('sandbox-local: backend noop cannot be combined with runnerCommand')
+    }
     if (runner.length === 0 && runnerFailureSignatures.length > 0) {
       throw new Error('sandbox-local: runnerFailureSignatures requires runnerCommand')
     }
@@ -291,23 +344,69 @@ export class LocalSandboxProvider extends SandboxProvider {
     if (runnerFailureSignatures.some(signature => signature.trim().length === 0 || /[\r\n]/u.test(signature))) {
       throw new Error('sandbox-local: runnerFailureSignatures entries must be non-empty single-line strings')
     }
+    this.backend = backend
     this.runnerCommand = runner.length > 0 ? runner : undefined
     this.configuredRunnerFailureSignatures = runnerFailureSignatures
     this.probeTimeoutMs = config.probeTimeoutMs as number
     assertPositiveFinite('probeTimeoutMs', this.probeTimeoutMs)
-    // The temp grants are revoked with the provider: a clean server
-    // shutdown leaves no temp ACEs behind (workspace ACEs stand by design —
-    // the reuse cache; an unclean shutdown leaves them for the next
-    // provision's exact-ACE skip).
+    // A provider start reclaims the grants an unclean earlier exit left
+    // behind (its lease was released by the kernel, so the sweep can take it).
+    // Sweep failures are reported, never fatal: a stale record must not stop
+    // the provider from confining new commands. The noop backend neither holds
+    // nor reclaims grants: it must not write a SACL or a label, sweep included.
+    if (backend === 'noop') {
+      this.ctx.logger.warn('sandbox-local: backend noop — commands run without OS confinement; the Windows restricted token, ACL grants, and integrity labels are not applied')
+    } else if ((this.internals.platform ?? process.platform) === 'win32') this.sweepStaleGrants()
+    // Both grant families are revoked with the provider, which clears the Low
+    // label a workspace-write period applied.
     ctx.effect(() => () => {
       this.revokeAclGrants()
     })
+    // `sandbox:clean-sacl` clears the granted trees ON DEMAND: the exit path
+    // never walks a tree (see cleanWorkspaceTree). The walk is synchronous and
+    // can take minutes on a large tree, so the handler yields to the current
+    // tick and reports progress through the logger instead of blocking the
+    // command itself.
+    const commands = commandRegistrar(ctx)
+    if (commands !== undefined) {
+      ctx.effect(() => commands.register({
+        name: 'sandbox:clean-sacl',
+        description: 'Clear the windows-acl Low labels and capability ACEs from this instance\'s granted workspace trees',
+        handler: () => {
+          const roots = [...this.workspaceGrants.keys()]
+          for (const root of roots) {
+            setTimeout(() => {
+              try {
+                const result = cleanWorkspaceTree(root)
+                this.ctx.logger.info(`sandbox-local: clean-sacl cleared ${String(result.cleaned.length)} of ${String(result.visited)} object(s) under ${root}`)
+                for (const failure of result.failures) {
+                  this.ctx.logger.warn(`sandbox-local: clean-sacl failed for ${root}: ${String(failure)}`)
+                }
+              } catch (error) {
+                this.ctx.logger.warn(`sandbox-local: clean-sacl failed for ${root}: ${String(error)}`)
+              }
+            }, 0)
+          }
+          return { kind: 'success', text: `cleaning ${String(roots.length)} granted workspace tree(s) in the background` }
+        },
+      }))
+    }
+  }
+
+  /** Reclaim stale windows-acl grants, reporting each failure through the logger. */
+  private sweepStaleGrants(): void {
+    const sweep = this.internals.sweepStaleGrants?.() ?? sweepStaleGrantLeases()
+    for (const failure of sweep.failures) {
+      this.ctx.logger.warn(`sandbox-local: windows-acl grant sweep failed: ${String(failure)}`)
+    }
   }
 
   /**
    * Wrap `argv` in the selected runner's invocation for `policy` — the configured
    * `runnerCommand` when present (the operator's assertion, no probe), else the platform
-   * chain's runner speaking its own profile dialect.
+   * chain's runner speaking its own profile dialect. Under
+   * `backend: 'noop'` there is no runner at all: the caller's argv is returned
+   * unchanged and reported as `partial` because no promised file effect is governed.
    *
    * @param argv - the exact argv the caller is about to spawn.
    * @param policy - the file-effect policy this execution runs under.
@@ -318,6 +417,17 @@ export class LocalSandboxProvider extends SandboxProvider {
    */
   async confine(argv: readonly string[], policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv> {
     signal?.throwIfAborted()
+    if (this.backend === 'noop') {
+      // No runner, so no denial dialect and no runner-failure rule exist to
+      // classify; `partial` states the fact a consumer needs — this execution
+      // does not hold an absolute boundary.
+      return Promise.resolve<ConfinedArgv>({
+        argv: [...argv],
+        enforcement: 'partial',
+        denialSignatures: [],
+        runnerFailureRules: [],
+      })
+    }
     policy = { ...policy, workspaceRoot: canonicalPath(policy.workspaceRoot) }
     if (this.runnerCommand !== undefined) {
       return Promise.resolve<ConfinedArgv>({
@@ -351,9 +461,9 @@ export class LocalSandboxProvider extends SandboxProvider {
   /**
    * The windows-acl runner argv for one policy. With a calling session (the
    * policy's `sessionId`) under workspace-write, the grants are materialized
-   * once per provider lifetime — the standing workspace-root grant per
-   * workspace and a revocable, RANDOM private-temp capability per live
-   * session/workspace pair. The runner receives `--write-sid` plus
+   * once per provider lifetime — one workspace-root grant per workspace and
+   * a RANDOM private-temp capability per live session/workspace pair, both
+   * revoked at provider dispose. The runner receives `--write-sid` plus
    * `--temp-write-sid` and grants nothing itself. Agentless workspace-write
    * calls pass the ambient temp ROOT and no SID flags: the runner creates and
    * removes a random private child directory for that one invocation.
@@ -383,9 +493,10 @@ export class LocalSandboxProvider extends SandboxProvider {
 
   /**
    * Materialize one workspace-write policy's ACEs once per provider
-   * lifetime. The workspace SID and standing root grant are shared by the
-   * workspace. The temp directory is random and carries a distinct SID, so
-   * another session on the same workspace cannot use the shared workspace
+   * lifetime. The workspace SID and its root grant are shared by the
+   * workspace and revoked with this provider, which clears the Low label the
+   * grant applied. The temp directory is random and carries a distinct SID,
+   * so another session on the same workspace cannot use the shared workspace
    * SID to enter it. A fresh provider always chooses a new path; crash
    * residue therefore cannot collide with or authorize a resumed session.
    * Fail-closed: a half-materialized temp grant is revoked and its directory
@@ -400,11 +511,14 @@ export class LocalSandboxProvider extends SandboxProvider {
     if (!this.workspaceGrants.has(workspaceRoot)) {
       const grant = AclWriteGrant.create(writeSid)
       try {
-        grant.add(workspaceRoot, true)
+        // Revocable: this provider owns the workspace grant's lease, so its
+        // dispose revokes the ACEs and clears the Low label. A workspace whose
+        // lease another live process holds is granted idempotently and left
+        // for that owner to revoke.
+        grant.add(workspaceRoot)
       } catch (error) {
-        // Free the SID; a standing ACE (if the apply succeeded before a
-        // post-apply throw) is the intended end state, not an error
-        // artifact — nothing to revoke.
+        // Free the SID; a lease taken before a post-apply throw is what
+        // dispose revokes, so a failed materialization leaves nothing behind.
         try {
           grant.dispose()
         } catch (cleanupError) {
@@ -448,13 +562,15 @@ export class LocalSandboxProvider extends SandboxProvider {
   }
 
   /**
-   * Dispose every write grant (provider dispose): the revocable temp ACEs
-   * are revoked, the private temp directories this provider created are
-   * removed, and every SID allocation is freed; the standing workspace ACEs
-   * stay (the reuse cache). Cleanup failures are reported, not thrown:
-   * cordis teardown must not be aborted by grant cleanup. A crash skips all
-   * of it, but a new provider never reuses the residue's random path or SID;
-   * OS temp hygiene (or manual removal) eventually reclaims it.
+   * Dispose every write grant in ONE pass at provider dispose — the DSH
+   * host's exit: each grant's ACEs are revoked (workspace roots included,
+   * which clears the shared Low label), the private temp directories this
+   * provider created are removed, and every SID allocation is freed. Nothing
+   * is revoked per session or per command. Cleanup failures are reported, not
+   * thrown: cordis teardown must not be aborted by grant cleanup. A crash
+   * skips all of it and leaves the leases free, so the next provider start
+   * sweeps the records and reclaims them; a new provider never reuses the
+   * residue's random path or SID either way.
    */
   private revokeAclGrants(): void {
     if (this.workspaceGrants.size === 0 && this.tempCapabilities.size === 0) return

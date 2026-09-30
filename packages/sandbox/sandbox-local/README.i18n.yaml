@@ -9,8 +9,8 @@
   en: 2331db3e4dfa8f89
   zh: 0182771f7e1b1cd4
 /deepseek-ai-dsh-sandbox-local/summary:
-  en: e8341fe6e38c08f6
-  zh: e38d6ff18fd2b701
+  en: 36dee4481b140d31
+  zh: 4aa4ca432a37471b
 /deepseek-ai-dsh-sandbox-local/table-of-contents:
   en: d152484eb41ac6b4
   zh: 09388d293f9be9cb
@@ -21,8 +21,11 @@
   en: 722ad601000b13c7
   zh: d2723f3743fe160b
 /deepseek-ai-dsh-sandbox-local/use-this-package/minimal-configuration:
-  en: 5d5ac6aaea69b3db
-  zh: 8049d91463b6347d
+  en: 5fde318521827c72
+  zh: 648fbe8d817d84c9
+/deepseek-ai-dsh-sandbox-local/use-this-package/no-op-backend:
+  en: 3d978f03194e2e8a
+  zh: 54765e6694d055af
 /deepseek-ai-dsh-sandbox-local/use-this-package/confined-execution-and-enforcement:
   en: 7282c9ec77fd6f01
   zh: 10e385a9489105e3
@@ -33,8 +36,8 @@
   en: 15db6ec303151ccc
   zh: 91f62c1f64192f92
 /deepseek-ai-dsh-sandbox-local/understand-the-implementation/runner-selection:
-  en: f0c44248c2ca6acc
-  zh: 554e9f706671d222
+  en: bfbb8b860c67dc6b
+  zh: b996347ec649ade1
 /deepseek-ai-dsh-sandbox-local/understand-the-implementation/platform-profiles:
   en: e87ee1858b20e643
   zh: fabdc6db8264dc11
@@ -42,8 +45,8 @@
   en: 62adfc9229c656cc
   zh: 11b1534b6d61e5de
 /deepseek-ai-dsh-sandbox-local/understand-the-implementation/source-map:
-  en: 8ab5bcc8dd97df3c
-  zh: ee7a6a237a142cbd
+  en: 671cc5b393ffca64
+  zh: 6eefcdfc5ae07a42
 /deepseek-ai-dsh-sandbox-local/further-exploration:
   en: 53e91b8be78bed12
   zh: 70f382c800dc191a
@@ -54,8 +57,8 @@
   en: e290ccc9b3c92c08
   zh: 469589ac12cdadab
 /deepseek-ai-dsh-sandbox-local/known-limitations-and-deferred-work:
-  en: b2a6a72e340bc620
-  zh: 9d9b2894850a131d
+  en: 033c49da0fb0309b
+  zh: 87bda5bf331d8595
 /deepseek-ai-dsh-sandbox-local/known-limitations-and-deferred-work/dev-note:
   en: cc273320f6a1beaf
   zh: 5c57a312ddc50651

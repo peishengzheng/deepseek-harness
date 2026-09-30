@@ -77,6 +77,26 @@ describe('installer preparation preserves application dependencies', () => {
     expect(config.artifactName).toBe('deepseek-harness-${version}-${os}-${arch}-unsigned.${ext}')
   })
 
+  it('appends the local build variant suffix after the unsigned marker and rejects a malformed one', async () => {
+    const { createElectronBuilderConfig } = await import('../scripts/electron-builder-config.mjs')
+    const environment = {
+      DSH_DESKTOP_APP_ID: 'com.example.installer',
+      DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN: 'https://policy.example.com',
+      DSH_DESKTOP_MANDATORY_UPDATE_CONFIG: JSON.stringify({ allowedAuthOrigins: ['https://login.example.com'] }),
+      DSH_DESKTOP_TARGET_PLATFORM: 'win32',
+      DSH_DESKTOP_TARGET_ARCH: 'x64',
+      DSH_DESKTOP_UNSIGNED: '1',
+    }
+    expect(createElectronBuilderConfig({ ...environment, DSH_DESKTOP_ARTIFACT_SUFFIX: '-no-low-level' }, 'win32', 'x64').artifactName)
+      .toBe('deepseek-harness-${version}-${os}-${arch}-unsigned-no-low-level.${ext}')
+    expect(createElectronBuilderConfig({ ...environment, DSH_DESKTOP_ARTIFACT_SUFFIX: '' }, 'win32', 'x64').artifactName)
+      .toBe('deepseek-harness-${version}-${os}-${arch}-unsigned.${ext}')
+    for (const suffix of ['no-low-level', '-No_Low', '-no level']) {
+      expect(() => createElectronBuilderConfig({ ...environment, DSH_DESKTOP_ARTIFACT_SUFFIX: suffix }, 'win32', 'x64'))
+        .toThrow('DSH_DESKTOP_ARTIFACT_SUFFIX must be dash-separated lowercase alphanumerics')
+    }
+  })
+
   it('packages every preload entry point the shell loads', async () => {
     const { readdirSync, readFileSync } = await import('node:fs')
     const sourceDirectory = new URL('../src/', import.meta.url)

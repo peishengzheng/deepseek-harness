@@ -169,6 +169,44 @@ describe('runnerCommand config', () => {
   )
 })
 
+describe('the noop backend', () => {
+  it('returns the caller argv unchanged at partial enforcement, with no dialect and no runner rule', async () => {
+    const probeBwrap = vi.fn(() => true)
+    // win32 + the real ACL surface: an auto backend would sweep leases at
+    // start and materialize grants for workspace-write, so an unchanged argv
+    // here proves neither happened.
+    const { sandbox } = await setup(
+      { backend: 'noop' },
+      { platform: 'win32', windowsAclRunnerArgs: ['node', 'windows-acl-runner.js'], probeBwrap },
+    )
+    expect(await sandbox.confine(['cmd', '/c', 'echo hi'], RO)).toEqual({
+      argv: ['cmd', '/c', 'echo hi'],
+      enforcement: 'partial',
+      denialSignatures: [],
+      runnerFailureRules: [],
+    })
+    expect(await sandbox.confine(['cmd', '/c', 'echo hi'], WW)).toEqual({
+      argv: ['cmd', '/c', 'echo hi'],
+      enforcement: 'partial',
+      denialSignatures: [],
+      runnerFailureRules: [],
+    })
+    expect(probeBwrap).not.toHaveBeenCalled()
+  })
+
+  it('rejects a configured runner, which noop never consults', async () => {
+    await expect(setup({
+      backend: 'noop',
+      runnerCommand: ['fake-runner'],
+      runnerFailureSignatures: ['fake-runner: profile rejected'],
+    })).rejects.toThrow('backend noop cannot be combined with runnerCommand')
+  })
+
+  it('rejects a backend outside the closed vocabulary', async () => {
+    await expect(setup({ backend: 'off' as never })).rejects.toThrow()
+  })
+})
+
 describe('the platform chains', () => {
   it('linux probes bwrap first: a passing probe wraps with the bwrap dialect at full enforcement', async () => {
     const probeBwrap = vi.fn(() => true)

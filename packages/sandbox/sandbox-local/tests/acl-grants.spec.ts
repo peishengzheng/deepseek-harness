@@ -1,8 +1,9 @@
 /**
  * windows-acl grant ownership through the real LocalSandboxProvider: one
- * standing capability per workspace plus one random, distinct, revocable
- * temp capability per live session/workspace pair. The Win32 grant surface
- * is mocked; native access checks live in sandbox-windows-acl's runner suite.
+ * provider-lifetime capability per workspace plus one random, distinct temp
+ * capability per live session/workspace pair, both revoked at provider
+ * dispose. The Win32 grant surface is mocked; native access checks live in
+ * sandbox-windows-acl's runner suite.
  */
 
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
@@ -18,8 +19,8 @@ import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local'
 const mockState = vi.hoisted(() => ({
   grants: [] as Array<{ writeSid: string; added: Array<{ path: string; standing: boolean }>; disposed: boolean }>,
   addFailure: undefined as Error | undefined,
-  /** Restrict an add failure to standing (workspace) or revocable (temp). */
-  addFailureStanding: undefined as boolean | undefined,
+  /** Restrict an add failure to the temp capability (`TEMP:` SID prefix) or the workspace one. */
+  addFailureTemp: undefined as boolean | undefined,
   createTempFailure: undefined as Error | undefined,
   disposeFailure: undefined as Error | undefined,
 }))
@@ -40,7 +41,7 @@ vi.mock('@deepseek-ai/dsh-sandbox-windows-acl', () => {
     add(path: string, standing = false): void {
       this.added.push({ path, standing })
       if (mockState.addFailure !== undefined
-        && (mockState.addFailureStanding === undefined || mockState.addFailureStanding === standing)) {
+        && (mockState.addFailureTemp === undefined || mockState.addFailureTemp === this.writeSid.startsWith('TEMP:'))) {
         throw mockState.addFailure
       }
     }
@@ -58,6 +59,7 @@ vi.mock('@deepseek-ai/dsh-sandbox-windows-acl', () => {
         throw new Error(`Windows ACL temp root must be outside the workspace: workspace=${workspaceRoot}; temp=${tempRoot}`)
       }
     },
+    sweepStaleGrantLeases: () => ({ revoked: [], failures: [] }),
     workspaceWriteSid: () => 'S-1-4-42-42',
     tempWriteSid: (path: string) => `TEMP:${path}`,
   }
@@ -88,7 +90,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
   beforeEach(() => {
     mockState.grants = []
     mockState.addFailure = undefined
-    mockState.addFailureStanding = undefined
+    mockState.addFailureTemp = undefined
     mockState.createTempFailure = undefined
     mockState.disposeFailure = undefined
   })
@@ -115,7 +117,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
     } finally { await fiber.dispose(); cleanup() }
   })
 
-  it('workspace-write materializes one standing workspace grant and one private temp capability, then reuses both', async () => {
+  it('workspace-write materializes one provider-lifetime workspace grant and one private temp capability, then reuses both', async () => {
     try {
       const { sandbox, fiber } = await setup()
       const ws = workspaceRoot()
@@ -140,7 +142,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
         'pwsh', '/Command', 'x',
       ])
       expect(mockState.grants).toEqual([
-        expect.objectContaining({ writeSid: WORKSPACE_SID, added: [{ path: ws, standing: true }], disposed: false }),
+        expect.objectContaining({ writeSid: WORKSPACE_SID, added: [{ path: ws, standing: false }], disposed: false }),
         expect.objectContaining({ writeSid: tempSid, added: [{ path: tempDir, standing: false }], disposed: false }),
       ])
       expect(existsSync(tempDir ?? '')).toBe(true)
@@ -240,7 +242,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
       const { sandbox } = await setup()
       const ws = workspaceRoot()
       scratch.push(ws)
-      mockState.addFailureStanding = true
+      mockState.addFailureTemp = false
       mockState.addFailure = new Error('workspace grant exploded')
       await expect(sandbox.confine(['true'], {
         mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('workspace-fail'),
@@ -279,7 +281,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
       expect(mockState.grants).toHaveLength(1) // workspace only; random temp was removed
 
       mockState.createTempFailure = undefined
-      mockState.addFailureStanding = false
+      mockState.addFailureTemp = true
       mockState.addFailure = new Error('temp add exploded')
       await expect(sandbox.confine(['true'], {
         mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('add-fail'),
@@ -289,7 +291,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
       expect(failedTempGrant?.added).toHaveLength(1)
       expect(existsSync(failedTempGrant?.added[0]?.path ?? '')).toBe(false)
 
-      mockState.addFailureStanding = false
+      mockState.addFailureTemp = true
       mockState.addFailure = new Error('temp add exploded')
       sandbox.internals.rmTempDir = () => { throw new Error('temp rm exploded') }
       await expect(sandbox.confine(['true'], {
@@ -297,7 +299,7 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
       })).rejects.toThrow(/temp grant materialization failed and its cleanup also failed/u)
       delete sandbox.internals.rmTempDir
 
-      mockState.addFailureStanding = false
+      mockState.addFailureTemp = true
       mockState.addFailure = new Error('temp add exploded')
       mockState.disposeFailure = new Error('temp cleanup exploded')
       await expect(sandbox.confine(['true'], {
