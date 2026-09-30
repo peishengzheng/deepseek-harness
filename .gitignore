@@ -46,5 +46,5 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
-.bat
-.cmd
+/*.bat
+/*.cmd
